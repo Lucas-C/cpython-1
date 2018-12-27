@@ -69,6 +69,145 @@ static int fuzz_builtin_int(const char* data, size_t size) {
     return 0;
 }
 
+static size_t strlen_with_max(const char *str, size_t max) {
+    const char *start = str;
+    while((str - start) < (long)max && *str) str++;
+    return (size_t) (str - start);
+}
+
+/*
+  Given a char buffer `data` of size `size`,
+  returns a new one of length <= `size`, ending with a NULL character,
+  but ensured to not contain any other NULL character.
+  Its content is identitcal up to the first NULL character met in `data`.
+
+  The returned pointer points to newly "malloc-ed" memory and hence must be "freed".
+ */
+static char* truncate_string_to_first_null_character(const char *data, size_t size) {
+    const size_t newSize = strlen_with_max(data, size) + 1;
+    char* nullTerminatedData = malloc(newSize);
+    const size_t copiedSize = (newSize < size) ? newSize : size;
+    strncpy(nullTerminatedData, data, copiedSize);
+    nullTerminatedData[newSize - 1] = '\0';
+    return nullTerminatedData;
+}
+
+static const char* _next_non_whitespace_char(const char* c) {
+    while (*c != '\0' && (*c == ' ' || *c == '\n')) c++;
+    return c;
+}
+
+static const char* _prev_non_whitespace_char(const char* data, int max_lookbehind) {
+    const char* c = data;
+    while ((data - c) < max_lookbehind) {
+        c--;
+        if (*c != ' ' && *c != '\n') break;
+    };
+    return c;
+}
+
+/* The fuzzing engine sometimes end up to generate huge integer computations that timeout.
+   For exemple 52**52**52.
+   Hence we have to blacklist those kind of inputs.
+   Currently this only checks for: \d**\d{5} and \d**\d+**\d patterns */
+static int is_python_input_at_risk_to_timeout(const char* data) {
+    int i = -1;
+    while (data[++i] != '\0') {
+        // We start our investigation on every exponent operator: **
+        if (data[i] != '*' || data[i + 1] != '*') {
+            continue;
+        }
+        // We bail if the character before was not a digit
+        const char* c = _prev_non_whitespace_char(data + i, i);
+        if (*c < '0' || *c > '9') {
+            continue;
+        }
+        // We now try to detect a too big exponent:
+        int consecutive_digits_count = 0;
+        c = _next_non_whitespace_char(data + i + 2) - 1;
+        while (*++c != '\0') {
+            if (*c < '0' || *c > '9') {
+                const char* nc = _next_non_whitespace_char(c);
+                if (consecutive_digits_count > 0 && *nc == '*' && nc[1] == '*') {
+                    // We found a second exponent operator chained: we risk a timeout !
+                    return 1;
+                }
+                // Neither a digit nor an exponent operator: we exit the sub-loop
+                break;
+            }
+            consecutive_digits_count += 1;
+            if (consecutive_digits_count >= 5) {
+                // The exponent is at least 5 digits long: we risk a timeout !
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Fuzz PyRun_SimpleString */
+static int fuzz_builtin_exec(const char* data, size_t size) {
+    if (size <= 0) return 0;
+    char* nullTerminatedData = truncate_string_to_first_null_character(data, size);
+    if (!is_python_input_at_risk_to_timeout(nullTerminatedData)) {
+        // We set Py_InspectFlag so that the next call returns normally even if a SystemExit is raised:
+        Py_InspectFlag = 1;
+        PyRun_SimpleString(nullTerminatedData);
+        Py_InspectFlag = 0;
+    }
+    free(nullTerminatedData);
+    return 0;
+}
+
+#ifndef JSON_DECODER_MODULE
+#define JSON_DECODER_MODULE json.decoder
+#endif
+#define STR(s) #s
+#define XSTR(x) STR(x)
+
+// Fuzz json.decoder.JSONDecoder().decode(data)
+// By making "json.decoder" a macro constant we allow reuse of this fuzz target
+// for other implementations following the same API, e.g. simplejson
+static int fuzz_json_decode(const char* data, size_t size) {
+    if (size <= 0) return 0;
+    char* nullTerminatedData = truncate_string_to_first_null_character(data, size);
+
+    PyObject *args, *jsonDecoderModule, *JSONDecoderClass, *jsonDecoder, *decodeMethod;
+
+    jsonDecoderModule = PyImport_ImportModule(XSTR(JSON_DECODER_MODULE));
+    if (PyErr_Occurred()) {
+        // An import error here is abnormal, we print the message:
+        PyErr_Print();
+        PyErr_Clear();
+        return 0;
+    }
+    JSONDecoderClass = PyObject_GetAttrString(jsonDecoderModule, "JSONDecoder");
+    Py_DECREF(jsonDecoderModule);
+
+    args = Py_BuildValue("()");
+    jsonDecoder = PyEval_CallObject(JSONDecoderClass, args);
+    Py_DECREF(args);
+    Py_DECREF(JSONDecoderClass);
+
+    decodeMethod = PyObject_GetAttrString(jsonDecoder, "decode");
+    Py_DECREF(jsonDecoder);
+
+    args = Py_BuildValue("(s)", nullTerminatedData);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    } else {
+        PyEval_CallObject(decodeMethod, args);
+        if (PyErr_Occurred() != NULL) {
+            PyErr_Clear();
+        }
+        Py_DECREF(args);
+    }
+    Py_DECREF(decodeMethod);
+
+    free(nullTerminatedData);
+    return 0;
+}
+
 /* Fuzz PyUnicode_FromStringAndSize as a proxy for unicode(str). */
 static int fuzz_builtin_unicode(const char* data, size_t size) {
     PyObject* s = PyUnicode_FromStringAndSize(data, size);
@@ -377,6 +516,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_unicode)
     rv |= _run_fuzz(data, size, fuzz_builtin_unicode);
+#endif
+#if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_exec)
+    assert(is_python_input_at_risk_to_timeout("999 **  99999"));
+    assert(is_python_input_at_risk_to_timeout("52**52**52"));
+    assert(!is_python_input_at_risk_to_timeout("2**10"));
+    assert(!is_python_input_at_risk_to_timeout("**10"));
+    rv |= _run_fuzz(data, size, fuzz_builtin_exec);
+#endif
+#if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_json_decode)
+    rv |= _run_fuzz(data, size, fuzz_json_decode);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_json_loads)
     static int JSON_LOADS_INITIALIZED = 0;
