@@ -18,6 +18,7 @@ class TestFuzzer(unittest.TestCase):
         _xxtestfuzz.run(b"1")
         _xxtestfuzz.run(b"AAAAAAA")
         _xxtestfuzz.run(b"AAAAAA\0")
+        _xxtestfuzz.run(b"print('VALID PRINT INSTRUCTION')")
 
 
 if __name__ == "__main__":
