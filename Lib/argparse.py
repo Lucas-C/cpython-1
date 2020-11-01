@@ -529,7 +529,8 @@ class HelpFormatter(object):
         if action.help:
             help_text = self._expand_help(action)
             help_lines = self._split_lines(help_text, help_width)
-            parts.append('%*s%s\n' % (indent_first, '', help_lines[0]))
+            if help_lines:
+                parts.append('%*s%s\n' % (indent_first, '', help_lines[0]))
             for line in help_lines[1:]:
                 parts.append('%*s%s\n' % (help_position, '', line))
 
